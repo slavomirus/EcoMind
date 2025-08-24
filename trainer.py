@@ -2,23 +2,68 @@ import os
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
-from keras.models import Model
+from keras.models import Model, load_model
 from keras.layers import Dense, GlobalAveragePooling2D, Dropout, Input, BatchNormalization
 from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, TensorBoard
 import matplotlib.pyplot as plt
 from sklearn.utils.class_weight import compute_class_weight
+import json
+import pickle
 
 tf.get_logger().setLevel('ERROR')
 
 # --- Konfiguracja ---
-data_dir = 'datasetv2'
+data_dir = 'EcoMind/datasetv2'
 class_names = ['battery', 'biological', 'brown-glass', 'cardboard', 'clothes',
                'green-glass', 'metal', 'paper', 'plastic', 'shoes', 'trash', 'white-glass']
 
-IMG_SIZE = (224, 224)  # Zwiększ rozmiar dla lepszej dokładności
+IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
 NUM_CLASSES = len(class_names)
 EPOCHS = 100
+
+
+# --- Funkcje do zapisywania i wczytywania historii ---
+def save_training_history(history, filename='training_history.pkl'):
+    """Zapisz historię treningu do pliku"""
+    with open(filename, 'wb') as f:
+        pickle.dump(history, f)
+    print(f"Historia treningu zapisana jako {filename}")
+
+
+def load_training_history(filename='training_history.pkl'):
+    """Wczytaj historię treningu z pliku"""
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'rb') as f:
+                history = pickle.load(f)
+            print(f"Historia treningu wczytana z {filename}")
+            return history
+        except Exception as e:
+            print(f"Błąd podczas wczytywania historii: {e}")
+            return None
+    else:
+        print("Nie znaleziono pliku z historią treningu")
+        return None
+
+
+def save_combined_history(existing_history, new_history, filename='combined_training_history.pkl'):
+    """Połącz i zapisz historię treningu"""
+    if existing_history and new_history:
+        combined_history = {}
+        for key in existing_history.keys():
+            if key in new_history:
+                combined_history[key] = existing_history[key] + new_history[key]
+            else:
+                combined_history[key] = existing_history[key]
+        save_training_history(combined_history, filename)
+        return combined_history
+    elif new_history:
+        save_training_history(new_history, filename)
+        return new_history
+    else:
+        return existing_history
+
 
 # --- Analiza i przygotowanie danych ---
 print("==== Analiza danych ====")
@@ -89,6 +134,40 @@ class_weights_dict = dict(enumerate(class_weights))
 print("Wagi klas:", class_weights_dict)
 
 
+# --- Sprawdź czy istnieje zapisany model i historia ---
+def load_existing_model_and_history():
+    model_path = 'EcoMind/best_model.keras'
+    history_path = 'EcoMind/training_history.pkl'
+
+    model = None
+    existing_history = None
+    initial_epoch = 0
+
+    # Wczytaj model jeśli istnieje
+    if os.path.exists(model_path):
+        print(f"Znaleziono istniejący model: {model_path}")
+        try:
+            model = load_model(model_path)
+            print("Model pomyślnie wczytany!")
+
+            # Wczytaj historię jeśli istnieje
+            existing_history = load_training_history(history_path)
+            if existing_history:
+                # Oblicz początkową epokę na podstawie historii
+                if 'accuracy' in existing_history:
+                    initial_epoch = len(existing_history['accuracy'])
+                    print(f"Kontynuuję trening od epoki {initial_epoch}")
+        except Exception as e:
+            print(f"Błąd podczas wczytywania modelu: {e}")
+            print("Tworzę nowy model...")
+            model = None
+            existing_history = None
+    else:
+        print("Nie znaleziono istniejącego modelu. Tworzę nowy model...")
+
+    return model, existing_history, initial_epoch
+
+
 # --- Poprawiona architektura modelu ---
 def create_improved_model():
     # Użyj bardziej zaawansowanej bazy
@@ -132,19 +211,37 @@ callbacks_list = [
     TensorBoard(log_dir='./logs', histogram_freq=1)
 ]
 
-# --- Trening ---
-print("==== Krok 1: Trening z zamrożonymi warstwami ====")
-model = create_improved_model()
+# --- Sprawdź i wczytaj istniejący model i historię ---
+print("==== Sprawdzanie istniejącego modelu i historii ====")
+model, existing_history, initial_epoch = load_existing_model_and_history()
+
+if model is None:
+    print("==== Tworzenie nowego modelu ====")
+    model = create_improved_model()
+
 model.summary()
 
-history = model.fit(
+# --- Trening ---
+print(f"\n==== Rozpoczynanie treningu od epoki {initial_epoch} ====")
+
+print("=== Etap 1: Trening z zamrożonymi warstwami ===")
+history_stage1 = model.fit(
     train_generator,
     epochs=EPOCHS,
     validation_data=val_generator,
     callbacks=callbacks_list,
     class_weight=class_weights_dict,
-    verbose=1
+    verbose=1,
+    initial_epoch=initial_epoch
 )
+
+# Zapisz historię po pierwszym etapie
+current_history = history_stage1.history
+if existing_history:
+    combined_history = save_combined_history(existing_history, current_history, 'training_history_stage1.pkl')
+else:
+    save_training_history(current_history, 'training_history_stage1.pkl')
+    combined_history = current_history
 
 print("\n==== Krok 2: Fine-tuning ====")
 # Odmroź więcej warstw
@@ -165,14 +262,28 @@ model.compile(
 
 model.summary()
 
-history_fine_tune = model.fit(
+print("=== Etap 2: Fine-tuning ===")
+history_stage2 = model.fit(
     train_generator,
-    epochs=EPOCHS,
+    epochs=EPOCHS + 50,
     validation_data=val_generator,
     callbacks=callbacks_list,
     class_weight=class_weights_dict,
-    verbose=1
+    verbose=1,
+    initial_epoch=EPOCHS
 )
+
+# Połącz i zapisz pełną historię
+full_history = {}
+for key in history_stage1.history.keys():
+    if key in history_stage2.history:
+        full_history[key] = history_stage1.history[key] + history_stage2.history[key]
+
+if combined_history:
+    final_history = save_combined_history(combined_history, full_history, 'training_history_full.pkl')
+else:
+    save_training_history(full_history, 'training_history_full.pkl')
+    final_history = full_history
 
 # --- Ocena ---
 print("\n==== Ocena modelu ====")
@@ -191,30 +302,31 @@ print(f'Dokładność testowa: {test_acc:.4f}')
 print(f'Top-5 dokładność: {test_top5:.4f}')
 
 # --- Wizualizacja ---
-full_history = {
-    'accuracy': history.history['accuracy'] + history_fine_tune.history['accuracy'],
-    'val_accuracy': history.history['val_accuracy'] + history_fine_tune.history['val_accuracy'],
-    'loss': history.history['loss'] + history_fine_tune.history['loss'],
-    'val_loss': history.history['val_loss'] + history_fine_tune.history['val_loss']
-}
-
 plt.figure(figsize=(15, 5))
 
 plt.subplot(1, 3, 1)
-plt.plot(full_history['accuracy'], label='Trening')
-plt.plot(full_history['val_accuracy'], label='Walidacja')
-plt.title('Dokładność modelu')
-plt.xlabel('Epoka')
-plt.ylabel('Dokładność')
-plt.legend()
+if final_history and 'accuracy' in final_history:
+    plt.plot(final_history['accuracy'], label='Trening')
+    plt.plot(final_history['val_accuracy'], label='Walidacja')
+    plt.title('Dokładność modelu')
+    plt.xlabel('Epoka')
+    plt.ylabel('Dokładność')
+    plt.legend()
+else:
+    plt.text(0.5, 0.5, 'Brak danych historii', ha='center', va='center')
+    plt.title('Brak danych historii')
 
 plt.subplot(1, 3, 2)
-plt.plot(full_history['loss'], label='Trening')
-plt.plot(full_history['val_loss'], label='Walidacja')
-plt.title('Strata modelu')
-plt.xlabel('Epoka')
-plt.ylabel('Strata')
-plt.legend()
+if final_history and 'loss' in final_history:
+    plt.plot(final_history['loss'], label='Trening')
+    plt.plot(final_history['val_loss'], label='Walidacja')
+    plt.title('Strata modelu')
+    plt.xlabel('Epoka')
+    plt.ylabel('Strata')
+    plt.legend()
+else:
+    plt.text(0.5, 0.5, 'Brak danych historii', ha='center', va='center')
+    plt.title('Brak danych historii')
 
 # Macierz pomyłek
 from sklearn.metrics import confusion_matrix, classification_report
@@ -242,3 +354,24 @@ print(classification_report(y_true, y_pred_classes, target_names=class_names))
 # Zapisz finalny model
 model.save('final_waste_classification_model.h5')
 print("Model zapisany jako 'final_waste_classification_model.h5'")
+
+# Zapisz również w formacie .keras dla przyszłej kontynuacji
+model.save('best_model.keras')
+print("Model zapisany również jako 'best_model.keras' dla przyszłej kontynuacji treningu")
+
+# Zapisz ostatnią historię
+save_training_history(final_history, 'training_history.pkl')
+print("Ostatnia historia treningu zapisana")
+
+# Zapisz informacje o treningu do pliku tekstowego
+training_info = {
+    'total_epochs': len(final_history['accuracy']) if final_history and 'accuracy' in final_history else 0,
+    'final_accuracy': test_acc,
+    'final_top5_accuracy': test_top5,
+    'class_distribution': train_class_counts,
+    'timestamp': str(np.datetime64('now'))
+}
+
+with open('training_info.json', 'w') as f:
+    json.dump(training_info, f, indent=4)
+print("Informacje o treningu zapisane do 'training_info.json'")
